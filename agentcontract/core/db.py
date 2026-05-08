@@ -14,6 +14,11 @@ from agentcontract.core.models import (
     ConflictRecord,
     IntentDeclaration,
     NegotiationSession,
+    AuditEvent,
+    CapabilityAdvertisement,
+    AgentTeam,
+    QueuedMessage,
+    ReputationRating,
     WitnessRecord,
 )
 
@@ -83,12 +88,85 @@ class AgentContractDB:
                     agent_id TEXT NOT NULL,
                     pattern TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS message_queue (
+                    message_id TEXT PRIMARY KEY,
+                    recipient_id TEXT NOT NULL,
+                    topic TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    visible_at TEXT NOT NULL,
+                    leased_until TEXT,
+                    payload TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_message_queue_delivery
+                    ON message_queue(recipient_id, topic, status, visible_at);
+                CREATE TABLE IF NOT EXISTS capabilities (
+                    capability_id TEXT PRIMARY KEY,
+                    agent_id TEXT NOT NULL,
+                    capability TEXT NOT NULL,
+                    scope TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    payload TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_capabilities_name ON capabilities(capability);
+                CREATE TABLE IF NOT EXISTS teams (
+                    team_id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS audit_events (
+                    event_id TEXT PRIMARY KEY,
+                    timestamp TEXT NOT NULL,
+                    actor_id TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    subject_type TEXT NOT NULL,
+                    subject_id TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_audit_subject ON audit_events(subject_type, subject_id);
+                CREATE TABLE IF NOT EXISTS reputation_ratings (
+                    rating_id TEXT PRIMARY KEY,
+                    subject_id TEXT NOT NULL,
+                    rater_id TEXT NOT NULL,
+                    payload TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_reputation_subject ON reputation_ratings(subject_id);
+                CREATE TABLE IF NOT EXISTS webhook_subscriptions (
+                    webhook_id TEXT PRIMARY KEY,
+                    event_type TEXT NOT NULL,
+                    target_url TEXT NOT NULL,
+                    secret TEXT,
+                    active INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS webhook_deliveries (
+                    delivery_id TEXT PRIMARY KEY,
+                    webhook_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    attempts INTEGER NOT NULL,
+                    payload TEXT NOT NULL
+                );
                 """
             )
 
     def clear(self) -> None:
         with self.connect() as conn:
-            for table in ["subscriptions", "negotiations", "witnesses", "contracts", "conflicts", "intents", "agents"]:
+            for table in [
+                "webhook_deliveries",
+                "webhook_subscriptions",
+                "reputation_ratings",
+                "audit_events",
+                "teams",
+                "capabilities",
+                "message_queue",
+                "subscriptions",
+                "negotiations",
+                "witnesses",
+                "contracts",
+                "conflicts",
+                "intents",
+                "agents",
+            ]:
                 conn.execute(f"DELETE FROM {table}")
 
     def save_agent(self, agent: AgentIdentity) -> AgentIdentity:
@@ -185,6 +263,97 @@ class AgentContractDB:
                 (session.session_id, session.conflict_id, session.status, payload),
             )
         return session
+
+    def save_message(self, message: QueuedMessage) -> QueuedMessage:
+        payload = _json(message.to_dict())
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO message_queue(
+                    message_id, recipient_id, topic, status, visible_at, leased_until, payload
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (message.message_id, message.recipient_id, message.topic, message.status, message.visible_at, message.leased_until, payload),
+            )
+        return message
+
+    def get_message(self, message_id: str) -> QueuedMessage | None:
+        row = self._one("SELECT payload FROM message_queue WHERE message_id = ?", (message_id,))
+        return QueuedMessage.from_dict(json.loads(row["payload"])) if row else None
+
+    def list_messages(self, status: str | None = None) -> list[QueuedMessage]:
+        if status is None:
+            rows = self._all("SELECT payload FROM message_queue ORDER BY rowid")
+        else:
+            rows = self._all("SELECT payload FROM message_queue WHERE status = ? ORDER BY rowid", (status,))
+        return [QueuedMessage.from_dict(json.loads(row["payload"])) for row in rows]
+
+    def save_capability(self, capability: CapabilityAdvertisement) -> CapabilityAdvertisement:
+        payload = _json(capability.to_dict())
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO capabilities(capability_id, agent_id, capability, scope, confidence, payload)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (capability.capability_id, capability.agent_id, capability.capability, _json({"scope": capability.scope}), capability.confidence, payload),
+            )
+        return capability
+
+    def list_capabilities(self) -> list[CapabilityAdvertisement]:
+        rows = self._all("SELECT payload FROM capabilities ORDER BY confidence DESC, rowid")
+        return [CapabilityAdvertisement.from_dict(json.loads(row["payload"])) for row in rows]
+
+    def save_team(self, team: AgentTeam) -> AgentTeam:
+        payload = _json(team.to_dict())
+        with self.connect() as conn:
+            conn.execute("INSERT OR REPLACE INTO teams(team_id, name, payload) VALUES (?, ?, ?)", (team.team_id, team.name, payload))
+        return team
+
+    def get_team(self, team_id: str) -> AgentTeam | None:
+        row = self._one("SELECT payload FROM teams WHERE team_id = ?", (team_id,))
+        return AgentTeam.from_dict(json.loads(row["payload"])) if row else None
+
+    def list_teams(self) -> list[AgentTeam]:
+        return [AgentTeam.from_dict(json.loads(row["payload"])) for row in self._all("SELECT payload FROM teams ORDER BY name")]
+
+    def save_audit_event(self, event: AuditEvent) -> AuditEvent:
+        payload = _json(event.to_dict())
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO audit_events(
+                    event_id, timestamp, actor_id, action, subject_type, subject_id, payload
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (event.event_id, event.timestamp, event.actor_id, event.action, event.subject_type, event.subject_id, payload),
+            )
+        return event
+
+    def list_audit_events(self, subject_type: str | None = None, subject_id: str | None = None) -> list[AuditEvent]:
+        sql = "SELECT payload FROM audit_events"
+        params: list[Any] = []
+        if subject_type and subject_id:
+            sql += " WHERE subject_type = ? AND subject_id = ?"
+            params.extend([subject_type, subject_id])
+        sql += " ORDER BY timestamp, rowid"
+        return [AuditEvent.from_dict(json.loads(row["payload"])) for row in self._all(sql, params)]
+
+    def save_reputation_rating(self, rating: ReputationRating) -> ReputationRating:
+        payload = _json(rating.to_dict())
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO reputation_ratings(rating_id, subject_id, rater_id, payload) VALUES (?, ?, ?, ?)",
+                (rating.rating_id, rating.subject_id, rating.rater_id, payload),
+            )
+        return rating
+
+    def list_reputation_ratings(self, subject_id: str | None = None) -> list[ReputationRating]:
+        if subject_id is None:
+            rows = self._all("SELECT payload FROM reputation_ratings ORDER BY rowid")
+        else:
+            rows = self._all("SELECT payload FROM reputation_ratings WHERE subject_id = ? ORDER BY rowid", (subject_id,))
+        return [ReputationRating.from_dict(json.loads(row["payload"])) for row in rows]
 
     def get_negotiation_for_conflict(self, conflict_id: str) -> NegotiationSession | None:
         row = self._one("SELECT payload FROM negotiations WHERE conflict_id = ? ORDER BY rowid DESC LIMIT 1", (conflict_id,))
